@@ -801,9 +801,8 @@ Originally written by Paul Issartel."
 
 (defun nndiscourse-get-categories (server)
   "Query SERVER /categories.json."
-  (seq-filter (lambda (x) (eq json-false (plist-get x :read_restricted)))
-              (let ((cats (funcall #'nndiscourse-rpc-request server "categories")))
-                (when (seqp cats) cats))))
+  (let ((cats (funcall #'nndiscourse-rpc-request server "categories")))
+    (when (seqp cats) cats)))
 
 (cl-defun nndiscourse-get-topics (server slug &key (page 0))
   "Query SERVER /c/SLUG/l/latest.json, optionally for PAGE."
