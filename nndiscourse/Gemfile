@@ -2,6 +2,8 @@
 
 source 'https://rubygems.org'
 
+ruby '2.6.2'
+
 gem 'discourse_api', github: 'dickmao/discourse_api', branch: 'dev'
 gem 'jimson', github: 'dickmao/jimson', branch: 'next'
 
