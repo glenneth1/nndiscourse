@@ -737,19 +737,39 @@ Originally written by Paul Issartel."
               (csrf-token (nndiscourse--get-csrf-token server))
               (_ (message "Got CSRF token: %s" csrf-token))
               (url (format "%s://%s/session" nndiscourse-scheme server)))
+    (message "Sending login request to %s" url)
     (request url
              :type "POST"
-             :headers `(("X-CSRF-Token" . ,csrf-token))
-             :data `((login . ,(plist-get auth-info :user))
-                     (password . ,(plist-get auth-info :password)))
-             :parser 'json-read
+             :headers `(("X-CSRF-Token" . ,csrf-token)
+                       ("User-Agent" . "Mozilla/5.0")
+                       ("Accept" . "application/json")
+                       ("Content-Type" . "application/json")
+                       ("X-Requested-With" . "XMLHttpRequest"))
+             :data (json-encode
+                    `((login . ,(plist-get auth-info :user))
+                      (password . ,(plist-get auth-info :password))))
+             :parser (lambda () 
+                      (condition-case err
+                          (json-read)
+                        (json-readtable-error
+                         (message "JSON parse error in login, raw response: %s" 
+                                  (buffer-string))
+                         nil)))
              :success (cl-function
-                      (lambda (&key response &allow-other-keys)
+                      (lambda (&key data response &allow-other-keys)
+                        (message "Login response headers: %S" (request-response-headers response))
+                        (message "Login response data: %S" data)
                         (when-let ((cookies (request-response-header response "set-cookie")))
+                          (message "Got cookies: %S" cookies)
                           (setq nndiscourse--session-cookies
                                 (if (listp cookies)
                                     (mapconcat #'identity cookies "; ")
                                   cookies)))))
+             :error (cl-function
+                    (lambda (&key error-thrown response &allow-other-keys)
+                      (message "Login request failed: %S" error-thrown)
+                      (message "Response status: %s" (request-response-status-code response))
+                      (message "Response headers: %S" (request-response-headers response))))
              :sync t)
     (and nndiscourse--csrf-token nndiscourse--session-cookies)))
 
