@@ -49,13 +49,33 @@
 (require 'subr-x)
 (require 'json-rpc)
 (require 'rbenv)
+(require 'auth-source)
+(require 'request)
 
 (nnoo-declare nndiscourse)
+
+(defvar nndiscourse--csrf-token nil
+  "CSRF token for the current forum session.")
+
+(defvar nndiscourse--session-cookies nil
+  "Cookies for the current Discourse session.")
+
+(defcustom nndiscourse-auth-source-file (expand-file-name "~/.authinfo.gpg")
+  "Location of .authinfo.gpg file for authentication."
+  :type '(file :must-match t)
+  :group 'nndiscourse)
 
 (nnoo-define-basics nndiscourse)
 
 (defvoo nndiscourse-scheme "https"
   "URI scheme for address.")
+
+(defvoo nndiscourse-server-address nil
+  "Discourse server address.")
+
+(defun nndiscourse-server-address (server)
+  "Get the server address for SERVER from parameters."
+  server)
 
 (defcustom nndiscourse-test-dir nil
   "Test bundler install from here (see Makefile)."
@@ -76,6 +96,11 @@ Otherwise, just display link."
 (defcustom nndiscourse-localhost "127.0.0.1"
   "Some users keep their browser in a separate domain."
   :type 'string
+  :group 'nndiscourse)
+
+(defcustom nndiscourse-auth-source-file (expand-file-name "~/.authinfo.gpg")
+  "Location of .authinfo.gpg file for authentication."
+  :type '(file :must-match t)
   :group 'nndiscourse)
 
 (defvoo nndiscourse-status-string "" "Out-of-band message.")
@@ -142,13 +167,20 @@ Thought I could use macros here to setf it."
 
 (defun nndiscourse-good-server (server)
   "SERVER needs to be a non-zero length string."
-  (or (and (stringp server) (not (zerop (length server)))
-           (prog1 t
-             (unless (nndiscourse--gethash server nndiscourse-by-server-hashtb)
-               (nndiscourse--sethash server
-                 (nndiscourse-by-server-initial)
-                 nndiscourse-by-server-hashtb))))
-      (prog1 nil (backtrace))))
+  (message "Checking server %s" server)
+  (let ((result
+         (or (and (stringp server) (not (zerop (length server)))
+                  (prog1 t
+                    (unless (nndiscourse--gethash server nndiscourse-by-server-hashtb)
+                      (message "Initializing server %s in hashtable" server)
+                      (nndiscourse--sethash server
+                        (nndiscourse-by-server-initial)
+                        nndiscourse-by-server-hashtb))))
+             (prog1 nil 
+               (message "Server %s is not valid" server)
+               (backtrace)))))
+    (message "Server %s is %s" server (if result "good" "bad"))
+    result))
 
 (defsubst nndiscourse--replace-hash (string func hashtable)
   "Set value of STRING to FUNC on STRING's extant value in HASHTABLE.
@@ -353,16 +385,26 @@ Return response of METHOD ARGS of type `json-object-type' or nil if failure."
 
 I am counting on `gnus-check-server` in `gnus-read-active-file-1' in
 `gnus-get-unread-articles' to open server upon install."
-  (when (nndiscourse-good-server server)
-    (or (nndiscourse-server-opened server)
-        (let ((original-global-rbenv-mode global-rbenv-mode))
+  (message "Opening nndiscourse server %s" server)
+  (if (nndiscourse-good-server server)
+      (or (and (nndiscourse-server-opened server)
+               (progn (message "Server %s is already opened" server) t))
+          (let ((original-global-rbenv-mode global-rbenv-mode))
           (unless global-rbenv-mode
             (let (rbenv-show-active-ruby-in-modeline)
               (global-rbenv-mode)))
           (unwind-protect
               (progn
+                (message "Initializing nndiscourse server %s..." server)
                 (when defs ;; defs should be non-nil when called from `gnus-open-server'
                   (nndiscourse--initialize))
+                (message "Attempting login for %s..." server)
+                (condition-case err
+                    (let ((auth-info (nndiscourse--get-auth-info server)))
+                      (message "Got auth info: %s" (plist-get auth-info :user))
+                      (nndiscourse--login server))
+                  (error
+                   (message "Login failed: %s" (error-message-string err))))
                 (nnoo-change-server 'nndiscourse server defs)
                 (let* ((proc-buf (nndiscourse--server-buffer server t))
                        (proc (get-buffer-process proc-buf)))
@@ -382,7 +424,7 @@ I am counting on `gnus-check-server` in `gnus-read-active-file-1' in
                            (ruby-command (split-string (format "%s exec thor cli:serve %s://%s -p %s"
                                                                (executable-find "bundle")
                                                                nndiscourse-scheme
-                                                               server
+                                                               (nndiscourse-server-address server)
                                                                free-port)))
                            (stderr-buffer (get-buffer-create (format " *%s-stderr*" server))))
                       (with-current-buffer stderr-buffer
@@ -393,11 +435,17 @@ I am counting on `gnus-check-server` in `gnus-read-active-file-1' in
                         free-port
                         (let ((default-directory
                                 (expand-file-name "nndiscourse"
-					          (or nndiscourse-test-dir
-						      (file-name-directory
-						       (or (locate-library "nndiscourse")
-						           default-directory))))))
-                          (let ((new-proc (make-process :name server
+                                                "/home/glenn/Projects/Code/nndiscourse")))
+                          (let* ((process-environment
+                                  (append
+                                   (list
+                                    (format "PATH=%s:%s"
+                                            "/home/glenn/.rbenv/shims:/home/glenn/.rbenv/bin"
+                                            (getenv "PATH"))
+                                    "BUNDLE_GEMFILE=/home/glenn/Projects/Code/nndiscourse/nndiscourse/Gemfile"
+                                    "RBENV_VERSION=2.6.2")
+                                   process-environment))
+                                 (new-proc (make-process :name server
                                                         :buffer proc-buf
                                                         :command ruby-command
                                                         :noquery t
@@ -621,10 +669,103 @@ Originally written by Paul Issartel."
       (nnheader-insert "%s\n" status))
     t))
 
+(defun nndiscourse--get-auth-info (server)
+  "Get authentication info for SERVER from .authinfo.gpg or prompt."
+  (condition-case err
+      (when (file-exists-p nndiscourse-auth-source-file)
+        (let* ((auth-source-creation-prompts
+                '((user . "Discourse user at %h: ")
+                  (secret . "Discourse password for %u@%h: ")))
+               (auth-info (car (auth-source-search :host server
+                                                 :port "https"
+                                                 :require '(:user :secret)
+                                                 :create t))))
+          (when auth-info
+            (list :user (plist-get auth-info :user)
+                  :password (let ((secret (plist-get auth-info :secret)))
+                             (if (functionp secret)
+                                 (funcall secret)
+                               secret))))))
+    (error
+     ;; If GPG fails, fall back to manual prompt
+     (let ((user (read-string (format "Discourse user at %s: " server)))
+           (pass (read-passwd (format "Discourse password for %s: " server))))
+       (list :user user :password pass)))))
+
+(defun nndiscourse--get-csrf-token (server)
+  "Get CSRF token for SERVER."
+  (let ((url (format "%s://%s/session/csrf" nndiscourse-scheme server)))
+    (message "Requesting CSRF token from %s" url)
+    (condition-case err
+        (progn
+          (request url
+                   :type "GET"
+                   :parser (lambda () 
+                            (condition-case err
+                                (json-read)
+                              (json-readtable-error
+                               (message "JSON parse error, raw response: %s" 
+                                        (buffer-string))
+                               nil)))
+                   :headers '(("User-Agent" . "Mozilla/5.0")
+                             ("Accept" . "application/json")
+                             ("X-Requested-With" . "XMLHttpRequest"))
+                   :success (cl-function
+                            (lambda (&key data response &allow-other-keys)
+                              (message "Got CSRF response headers: %S" (request-response-headers response))
+                              (message "Got CSRF response: %S" data)
+                              (when-let ((csrf-token (and (listp data) (alist-get 'csrf data))))
+                                (message "Setting CSRF token to %s" csrf-token)
+                                (setq nndiscourse--csrf-token csrf-token))))
+                   :error (cl-function
+                          (lambda (&key error-thrown response &allow-other-keys)
+                            (message "CSRF request failed: %S" error-thrown)
+                            (message "Response status: %s" (request-response-status-code response))
+                            (message "Response headers: %S" (request-response-headers response))))
+                   :sync t)
+          (or nndiscourse--csrf-token
+              (error "Failed to get CSRF token")))
+      (error
+       (message "Error getting CSRF token: %s" (error-message-string err))
+       nil))))
+
+(defun nndiscourse--login (server)
+  "Log in to SERVER using authinfo credentials."
+  (message "Starting login process for %s" server)
+  (when-let* ((auth-info (nndiscourse--get-auth-info server))
+              (_ (message "Got auth info for %s" server))
+              (csrf-token (nndiscourse--get-csrf-token server))
+              (_ (message "Got CSRF token: %s" csrf-token))
+              (url (format "%s://%s/session" nndiscourse-scheme server)))
+    (request url
+             :type "POST"
+             :headers `(("X-CSRF-Token" . ,csrf-token))
+             :data `((login . ,(plist-get auth-info :user))
+                     (password . ,(plist-get auth-info :password)))
+             :parser 'json-read
+             :success (cl-function
+                      (lambda (&key response &allow-other-keys)
+                        (when-let ((cookies (request-response-header response "set-cookie")))
+                          (setq nndiscourse--session-cookies
+                                (if (listp cookies)
+                                    (mapconcat #'identity cookies "; ")
+                                  cookies)))))
+             :sync t)
+    (and nndiscourse--csrf-token nndiscourse--session-cookies)))
+
+(defun nndiscourse--ensure-login (server)
+  "Ensure we are logged in to SERVER."
+  (unless (and nndiscourse--csrf-token nndiscourse--session-cookies)
+    (nndiscourse--login server)))
+
 (defun nndiscourse--request-item (id server)
   "Retrieve ID from SERVER as a property list."
+  (nndiscourse--ensure-login server)
   (let* ((port (nndiscourse-proc-info-port (cdr (assoc server nndiscourse-processes))))
          (conn (json-rpc-connect nndiscourse-localhost port))
+         (headers (when (and nndiscourse--csrf-token nndiscourse--session-cookies)
+                   `(("X-CSRF-Token" . ,nndiscourse--csrf-token)
+                     ("Cookie" . ,nndiscourse--session-cookies))))
          (utf-decoder (lambda (x)
                         (decode-coding-string (with-temp-buffer
                                                 (set-buffer-multibyte nil)
